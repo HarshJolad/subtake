@@ -1,0 +1,12 @@
+# Sample domains for testing subtake
+# Lines starting with '#' and blank lines are ignored
+blog.example.com
+help.acmecorp.net
+docs.startupxyz.io
+status.widgetco.com
+support.megacorp.org
+shop.testbrand.co
+cdn.oldproject.net
+app.legacy-startup.com
+careers.fakecorp.io
+portal.demosite.net

@@ -1,0 +1,297 @@
+"""Report writers: CSV, Markdown, and self-contained HTML."""
+
+from __future__ import annotations
+
+import csv
+import html
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+
+from .checker import Finding
+
+logger = logging.getLogger(__name__)
+
+# CSV column order
+_CSV_FIELDS = [
+    "domain",
+    "vulnerable",
+    "suspicious",
+    "service",
+    "confidence",
+    "final_cname",
+    "cname_chain",
+    "http_status",
+    "body_snippet",
+    "notes",
+]
+
+
+# ---------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------
+
+def write_csv(findings: Sequence[Finding], path: str | Path, all_findings: bool = False) -> int:
+    """Write findings to a CSV file.
+
+    Args:
+        findings: Sequence of :class:`Finding` objects to write.
+        path: Destination file path.
+        all_findings: If ``True``, include all findings. If ``False``, only
+            include vulnerable or suspicious entries.
+
+    Returns:
+        Number of rows written.
+    """
+    path = Path(path)
+    rows = [f for f in findings if (all_findings or f.vulnerable or f.suspicious)]
+    rows.sort(key=lambda f: (not f.vulnerable, not f.suspicious, f.domain))
+
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        for finding in rows:
+            writer.writerow({
+                "domain": finding.domain,
+                "vulnerable": finding.vulnerable,
+                "suspicious": finding.suspicious,
+                "service": finding.service,
+                "confidence": finding.confidence,
+                "final_cname": finding.final_cname or "",
+                "cname_chain": " -> ".join(finding.cname_chain),
+                "http_status": finding.http_status if finding.http_status != -1 else "",
+                "body_snippet": finding.body_snippet,
+                "notes": finding.notes,
+            })
+
+    logger.info("CSV written to %s (%d rows)", path, len(rows))
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Markdown
+# ---------------------------------------------------------------------------
+
+def write_markdown(findings: Sequence[Finding], path: str | Path) -> None:
+    """Write a Markdown summary report.
+
+    Args:
+        findings: Sequence of :class:`Finding` objects.
+        path: Destination file path.
+    """
+    path = Path(path)
+    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    vuln = [f for f in findings if f.vulnerable]
+    susp = [f for f in findings if f.suspicious and not f.vulnerable]
+    clean = [f for f in findings if not f.vulnerable and not f.suspicious]
+
+    lines: list[str] = [
+        "# Subdomain Takeover Report",
+        "",
+        f"Generated: {now}",
+        "",
+        "## Summary",
+        "",
+        f"| Metric | Count |",
+        f"|--------|-------|",
+        f"| Total domains checked | {len(findings)} |",
+        f"| **Vulnerable** | **{len(vuln)}** |",
+        f"| Suspicious | {len(susp)} |",
+        f"| Clean | {len(clean)} |",
+        "",
+    ]
+
+    if vuln:
+        lines += [
+            "## Vulnerable Findings",
+            "",
+            "| Domain | Service | Confidence | Final CNAME | HTTP Status | Notes |",
+            "|--------|---------|------------|-------------|-------------|-------|",
+        ]
+        for f in sorted(vuln, key=lambda x: x.domain):
+            cname = f.final_cname or "N/A"
+            status = str(f.http_status) if f.http_status != -1 else "N/A"
+            notes_md = f.notes.replace("|", "\\|")
+            lines.append(
+                f"| `{f.domain}` | {f.service} | {f.confidence} | `{cname}` | {status} | {notes_md} |"
+            )
+        lines.append("")
+
+    if susp:
+        lines += [
+            "## Suspicious Findings",
+            "",
+            "| Domain | Service | Confidence | Final CNAME | Notes |",
+            "|--------|---------|------------|-------------|-------|",
+        ]
+        for f in sorted(susp, key=lambda x: x.domain):
+            cname = f.final_cname or "N/A"
+            notes_md = f.notes.replace("|", "\\|")
+            lines.append(
+                f"| `{f.domain}` | {f.service} | {f.confidence} | `{cname}` | {notes_md} |"
+            )
+        lines.append("")
+
+    lines += [
+        "## All Findings (Clean)",
+        "",
+        "| Domain | CNAME Chain | Notes |",
+        "|--------|-------------|-------|",
+    ]
+    for f in sorted(clean, key=lambda x: x.domain):
+        chain = " -> ".join(f.cname_chain) if f.cname_chain else "None"
+        notes_md = f.notes.replace("|", "\\|")
+        lines.append(f"| `{f.domain}` | {chain} | {notes_md} |")
+    lines.append("")
+
+    lines += [
+        "---",
+        "",
+        "*Generated by [subtake](https://github.com/subtake/subtake)*",
+        "",
+    ]
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Markdown report written to %s", path)
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+
+_HTML_CSS = """
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           margin: 0; background: #0d1117; color: #c9d1d9; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+    h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: .5rem; }
+    h2 { color: #79c0ff; margin-top: 2rem; }
+    .stats { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1.5rem 0; }
+    .stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                 padding: 1rem 1.5rem; min-width: 140px; text-align: center; }
+    .stat-card .value { font-size: 2rem; font-weight: 700; }
+    .stat-card .label { font-size: .85rem; color: #8b949e; }
+    .vuln .value { color: #f85149; }
+    .susp .value { color: #d29922; }
+    .clean .value { color: #3fb950; }
+    .total .value { color: #58a6ff; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .9rem; }
+    th { background: #161b22; color: #8b949e; text-align: left;
+         padding: .6rem .8rem; border-bottom: 2px solid #30363d; }
+    td { padding: .55rem .8rem; border-bottom: 1px solid #21262d; vertical-align: top; }
+    tr:hover td { background: #161b22; }
+    .badge { display: inline-block; border-radius: 4px; padding: .15rem .45rem;
+             font-size: .78rem; font-weight: 600; }
+    .badge-vuln  { background: #3d1f1f; color: #f85149; border: 1px solid #f85149; }
+    .badge-susp  { background: #2d2008; color: #d29922; border: 1px solid #d29922; }
+    .badge-clean { background: #1a2d1a; color: #3fb950; border: 1px solid #3fb950; }
+    .badge-high  { background: #3d1f1f; color: #f85149; }
+    .badge-med   { background: #2d2008; color: #d29922; }
+    .badge-low   { background: #1c2538; color: #79c0ff; }
+    code { background: #161b22; border: 1px solid #30363d; border-radius: 3px;
+           padding: .1rem .35rem; font-size: .85em; }
+    footer { margin-top: 3rem; color: #8b949e; font-size: .8rem; border-top: 1px solid #30363d;
+             padding-top: 1rem; }
+    .no-findings { color: #8b949e; font-style: italic; padding: 1rem 0; }
+"""
+
+
+def _badge(text: str, css_class: str) -> str:
+    return f'<span class="badge {css_class}">{html.escape(text)}</span>'
+
+
+def _confidence_badge(confidence: str) -> str:
+    mapping = {"HIGH": "badge-high", "MEDIUM": "badge-med", "LOW": "badge-low"}
+    return _badge(confidence, mapping.get(confidence, "badge-low"))
+
+
+def write_html(findings: Sequence[Finding], path: str | Path) -> None:
+    """Write a self-contained HTML report with inline CSS.
+
+    Args:
+        findings: Sequence of :class:`Finding` objects.
+        path: Destination file path.
+    """
+    path = Path(path)
+    now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    vuln = sorted([f for f in findings if f.vulnerable], key=lambda x: x.domain)
+    susp = sorted([f for f in findings if f.suspicious and not f.vulnerable], key=lambda x: x.domain)
+    clean = sorted([f for f in findings if not f.vulnerable and not f.suspicious], key=lambda x: x.domain)
+
+    def row(f: Finding, status: str) -> str:
+        chain = " → ".join(html.escape(c) for c in f.cname_chain) if f.cname_chain else "<em>none</em>"
+        cname = f"<code>{html.escape(f.final_cname)}</code>" if f.final_cname else "<em>none</em>"
+        http = str(f.http_status) if f.http_status != -1 else "—"
+        svc = html.escape(f.service) if f.service else "—"
+        conf = _confidence_badge(f.confidence) if f.confidence else "—"
+        notes = html.escape(f.notes)
+        snippet = f"<code>{html.escape(f.body_snippet[:120])}</code>" if f.body_snippet else "—"
+        badge_html = (
+            _badge("VULNERABLE", "badge-vuln") if f.vulnerable
+            else _badge("SUSPICIOUS", "badge-susp") if f.suspicious
+            else _badge("CLEAN", "badge-clean")
+        )
+        return (
+            f"<tr>"
+            f"<td><code>{html.escape(f.domain)}</code></td>"
+            f"<td>{badge_html}</td>"
+            f"<td>{svc}</td>"
+            f"<td>{conf}</td>"
+            f"<td>{cname}</td>"
+            f"<td style='font-size:.8em'>{chain}</td>"
+            f"<td>{http}</td>"
+            f"<td style='font-size:.8em'>{snippet}</td>"
+            f"<td style='font-size:.8em'>{notes}</td>"
+            f"</tr>"
+        )
+
+    def table_header() -> str:
+        cols = [
+            "Domain", "Status", "Service", "Confidence",
+            "Final CNAME", "CNAME Chain", "HTTP", "Body Snippet", "Notes",
+        ]
+        ths = "".join(f"<th>{c}</th>" for c in cols)
+        return f"<table><thead><tr>{ths}</tr></thead><tbody>"
+
+    vuln_rows = "".join(row(f, "vuln") for f in vuln) or '<tr><td colspan="9" class="no-findings">No vulnerable findings.</td></tr>'
+    susp_rows = "".join(row(f, "susp") for f in susp) or '<tr><td colspan="9" class="no-findings">No suspicious findings.</td></tr>'
+    clean_rows = "".join(row(f, "clean") for f in clean) or '<tr><td colspan="9" class="no-findings">No clean findings.</td></tr>'
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subdomain Takeover Report</title>
+<style>{_HTML_CSS}</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔍 Subdomain Takeover Report</h1>
+  <p style="color:#8b949e">Generated: {now}</p>
+
+  <div class="stats">
+    <div class="stat-card total"><div class="value">{len(findings)}</div><div class="label">Total Checked</div></div>
+    <div class="stat-card vuln"><div class="value">{len(vuln)}</div><div class="label">Vulnerable</div></div>
+    <div class="stat-card susp"><div class="value">{len(susp)}</div><div class="label">Suspicious</div></div>
+    <div class="stat-card clean"><div class="value">{len(clean)}</div><div class="label">Clean</div></div>
+  </div>
+
+  <h2>🚨 Vulnerable</h2>
+  {table_header()}{vuln_rows}</tbody></table>
+
+  <h2>⚠️ Suspicious</h2>
+  {table_header()}{susp_rows}</tbody></table>
+
+  <h2>✅ Clean</h2>
+  {table_header()}{clean_rows}</tbody></table>
+
+  <footer>Generated by <strong>subtake v0.1.0</strong> &mdash; Dangling DNS / Subdomain Takeover Checker</footer>
+</div>
+</body>
+</html>
+"""
+    path.write_text(html_doc, encoding="utf-8")
+    logger.info("HTML report written to %s", path)
